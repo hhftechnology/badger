@@ -1,10 +1,10 @@
-displayName: Pangolin (Badger)
+displayName: Badger- Reworked
 type: middleware
 iconPath: .assets/icon.png
 
-import: github.com/fosrl/badger
+import: github.com/hhftechnology/badger
 
-summary: Middleware auth bouncer for Pangolin
+summary: Middleware auth bouncer for Pangolin with x-forwarded support
 
 testData:
     apiBaseUrl: "http://localhost:3001/api/v1"

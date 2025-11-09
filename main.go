@@ -5,14 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 )
 
 type Config struct {
-	APIBaseUrl                  string `json:"apiBaseUrl"`
-	UserSessionCookieName       string `json:"userSessionCookieName"`
-	ResourceSessionRequestParam string `json:"resourceSessionRequestParam"`
+	APIBaseUrl                  string   `json:"apiBaseUrl"`
+	UserSessionCookieName       string   `json:"userSessionCookieName"`
+	ResourceSessionRequestParam string   `json:"resourceSessionRequestParam"`
+	TrustedProxies              []string `json:"trustedProxies,omitempty"`
+	TrustForwardedHeaders       bool     `json:"trustForwardedHeaders,omitempty"`
 }
 
 type Badger struct {
@@ -21,6 +24,9 @@ type Badger struct {
 	apiBaseUrl                  string
 	userSessionCookieName       string
 	resourceSessionRequestParam string
+	trustedProxies              []string
+	trustForwardedHeaders       bool
+	trustedProxyNets            []*net.IPNet
 }
 
 type VerifyBody struct {
@@ -66,16 +72,49 @@ func CreateConfig() *Config {
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+	// Parse trusted proxy networks
+	var trustedNets []*net.IPNet
+	for _, proxy := range config.TrustedProxies {
+		// Check if it's a CIDR notation
+		if strings.Contains(proxy, "/") {
+			_, ipNet, err := net.ParseCIDR(proxy)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR in trustedProxies: %s", proxy)
+			}
+			trustedNets = append(trustedNets, ipNet)
+		} else {
+			// Single IP address - convert to /32 or /128 CIDR
+			ip := net.ParseIP(proxy)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid IP in trustedProxies: %s", proxy)
+			}
+			
+			var mask net.IPMask
+			if ip.To4() != nil {
+				mask = net.CIDRMask(32, 32)
+			} else {
+				mask = net.CIDRMask(128, 128)
+			}
+			trustedNets = append(trustedNets, &net.IPNet{IP: ip, Mask: mask})
+		}
+	}
+
 	return &Badger{
 		next:                        next,
 		name:                        name,
 		apiBaseUrl:                  config.APIBaseUrl,
 		userSessionCookieName:       config.UserSessionCookieName,
 		resourceSessionRequestParam: config.ResourceSessionRequestParam,
+		trustedProxies:              config.TrustedProxies,
+		trustForwardedHeaders:       config.TrustForwardedHeaders,
+		trustedProxyNets:            trustedNets,
 	}, nil
 }
 
 func (p *Badger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// Get the real client IP
+	clientIP := p.getRealIP(req)
+	
 	cookies := p.extractCookies(req)
 
 	queryValues := req.URL.Query()
@@ -84,7 +123,7 @@ func (p *Badger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		body := ExchangeSessionBody{
 			RequestToken: &sessionRequestValue,
 			RequestHost:  &req.Host,
-			RequestIP:    &req.RemoteAddr,
+			RequestIP:    &clientIP,
 		}
 
 		jsonData, err := json.Marshal(body)
@@ -160,7 +199,7 @@ func (p *Badger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		RequestPath:        &req.URL.Path,
 		RequestMethod:      &req.Method,
 		TLS:                req.TLS != nil,
-		RequestIP:          &req.RemoteAddr,
+		RequestIP:          &clientIP,
 		Headers:            headers,
 		Query:              queryParams,
 	}
@@ -230,6 +269,116 @@ func (p *Badger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	http.Error(rw, "Unauthorized", http.StatusUnauthorized)
+}
+
+// getRealIP extracts the real client IP address from the request
+func (p *Badger) getRealIP(req *http.Request) string {
+	// Start with RemoteAddr as fallback
+	remoteIP, _, _ := net.SplitHostPort(req.RemoteAddr)
+	
+	// If we don't trust forwarded headers, return RemoteAddr
+	if !p.trustForwardedHeaders {
+		return remoteIP
+	}
+	
+	// Check if the request comes from a trusted proxy
+	if !p.isFromTrustedProxy(remoteIP) {
+		// If not from trusted proxy, don't trust forwarded headers
+		return remoteIP
+	}
+	
+	// Try to get IP from forwarded headers (in order of preference)
+	// 1. X-Forwarded-For (most common, can contain multiple IPs)
+	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
+		// X-Forwarded-For can contain multiple IPs separated by commas
+		// The first one should be the original client
+		ips := strings.Split(xff, ",")
+		if len(ips) > 0 {
+			// Trim whitespace and return the first IP
+			clientIP := strings.TrimSpace(ips[0])
+			if net.ParseIP(clientIP) != nil {
+				return clientIP
+			}
+		}
+	}
+	
+	// 2. X-Real-IP (single IP, used by some proxies like nginx)
+	if xri := req.Header.Get("X-Real-IP"); xri != "" {
+		clientIP := strings.TrimSpace(xri)
+		if net.ParseIP(clientIP) != nil {
+			return clientIP
+		}
+	}
+	
+	// 3. CF-Connecting-IP (Cloudflare specific)
+	if cfIP := req.Header.Get("CF-Connecting-IP"); cfIP != "" {
+		clientIP := strings.TrimSpace(cfIP)
+		if net.ParseIP(clientIP) != nil {
+			return clientIP
+		}
+	}
+	
+	// 4. True-Client-IP (Cloudflare Enterprise)
+	if tcIP := req.Header.Get("True-Client-IP"); tcIP != "" {
+		clientIP := strings.TrimSpace(tcIP)
+		if net.ParseIP(clientIP) != nil {
+			return clientIP
+		}
+	}
+	
+	// Fall back to RemoteAddr if no valid forwarded IP found
+	return remoteIP
+}
+
+// isFromTrustedProxy checks if the IP is from a trusted proxy
+func (p *Badger) isFromTrustedProxy(ip string) bool {
+	// If no trusted proxies configured, trust all (backward compatibility)
+	// might want to change this default behavior to be more secure
+	if len(p.trustedProxyNets) == 0 {
+		// Default: trust common private networks if none specified
+		return p.isPrivateIP(ip)
+	}
+	
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return false
+	}
+	
+	// Check if IP is in any trusted network
+	for _, trustedNet := range p.trustedProxyNets {
+		if trustedNet.Contains(parsedIP) {
+			return true
+		}
+	}
+	
+	return false
+}
+
+// isPrivateIP checks if an IP is in private IP ranges (RFC 1918)
+func (p *Badger) isPrivateIP(ip string) bool {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return false
+	}
+	
+	// Define private IP ranges
+	privateRanges := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+		"::1/128", // IPv6 loopback
+		"fc00::/7", // IPv6 private
+	}
+	
+	for _, cidr := range privateRanges {
+		_, ipNet, _ := net.ParseCIDR(cidr)
+		if ipNet != nil && ipNet.Contains(parsedIP) {
+			return true
+		}
+	}
+	
+	return false
 }
 
 func (p *Badger) extractCookies(req *http.Request) map[string]string {
